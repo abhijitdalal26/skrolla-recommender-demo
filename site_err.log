@@ -1,0 +1,19 @@
+::ffff:127.0.0.1 - - [01/Sep/2026 05:46:04] "GET / HTTP/1.1" 200 -
+::ffff:127.0.0.1 - - [01/Sep/2026 05:47:11] "GET /static/ HTTP/1.1" 200 -
+::ffff:127.0.0.1 - - [01/Sep/2026 05:47:13] "GET /static/ HTTP/1.1" 200 -
+::ffff:127.0.0.1 - - [01/Sep/2026 05:47:13] "GET /static/ HTTP/1.1" 200 -
+::ffff:127.0.0.1 - - [01/Sep/2026 05:47:17] "GET / HTTP/1.1" 200 -
+::ffff:127.0.0.1 - - [01/Sep/2026 05:47:17] "GET /static/embedding_3d.js HTTP/1.1" 200 -
+::ffff:127.0.0.1 - - [01/Sep/2026 05:47:17] "GET /static/embedding_3d_surface.js HTTP/1.1" 200 -
+::ffff:127.0.0.1 - - [01/Sep/2026 05:47:17] "GET /static/app.js HTTP/1.1" 200 -
+::ffff:127.0.0.1 - - [01/Sep/2026 05:47:17] "GET /static/style.css HTTP/1.1" 200 -
+::ffff:127.0.0.1 - - [01/Sep/2026 08:09:32] "GET /static/ HTTP/1.1" 200 -
+::ffff:127.0.0.1 - - [01/Sep/2026 08:09:32] code 404, message File not found
+::ffff:127.0.0.1 - - [01/Sep/2026 08:09:32] "GET /favicon.ico HTTP/1.1" 404 -
+::ffff:127.0.0.1 - - [01/Sep/2026 08:27:20] "GET /static/ HTTP/1.1" 200 -
+::ffff:127.0.0.1 - - [01/Sep/2026 08:27:21] code 404, message File not found
+::ffff:127.0.0.1 - - [01/Sep/2026 08:27:21] "GET /favicon.ico HTTP/1.1" 404 -
+::ffff:127.0.0.1 - - [01/Sep/2026 08:28:38] "GET /static/ HTTP/1.1" 200 -
+::ffff:127.0.0.1 - - [01/Sep/2026 14:52:23] "GET /static/ HTTP/1.1" 200 -
+::ffff:127.0.0.1 - - [01/Sep/2026 15:34:01] "GET /static/style.css HTTP/1.1" 200 -
+::ffff:127.0.0.1 - - [01/Sep/2026 15:34:20] "GET / HTTP/1.1" 200 -

@@ -17,3 +17,5 @@ __pycache__/
 # Vercel / node
 node_modules/
 .vercel
+
+.vercel

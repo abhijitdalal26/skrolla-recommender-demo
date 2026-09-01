@@ -9,6 +9,9 @@
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Newsreader:ital,opsz,wght@0,6..72,400;0,6..72,500;0,6..72,600;0,6..72,700;1,6..72,400&family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="static/style.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css">
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/contrib/auto-render.min.js" onload="renderMathInElement(document.body,{delimiters:[{left:'$$',right:'$$',display:true},{left:'\\[',right:'\\]',display:true},{left:'\\(',right:'\\)',display:false}]});"></script>
 </head>
 <body>
 
@@ -79,10 +82,16 @@
     <div id="feed" class="feed disc hidden"></div>
     <div id="picked" class="feed disc hidden"></div>
     <div id="search-out" class="feed disc hidden"></div>
+    <div id="infinite-sentinel" style="height:1px"></div>
   </section>
 
-  <!-- RIGHT: signal history + pipeline -->
+  <!-- RIGHT: taste + signals + pipeline -->
   <section class="col col-right">
+    <div class="card clusters-side-card">
+      <h2>Taste Clusters</h2>
+      <p id="cluster-empty" class="hint">Select genres above to create taste clusters.</p>
+      <div id="cluster-list"></div>
+    </div>
     <div class="card">
       <h2>Signal History</h2>
       <div id="signal-list" class="signal-list"></div>
@@ -98,17 +107,6 @@
     </div>
   </section>
 </main>
-
-<!-- ============ MAP + CLUSTERS (side by side) ============ -->
-<section class="map-section">
-  <div class="map-clusters-wrap">
-    <div class="card clusters-side-card">
-      <h2>Taste Clusters</h2>
-      <p id="cluster-empty" class="hint">Select genres above to create taste clusters.</p>
-      <div id="cluster-list"></div>
-    </div>
-  </div>
-</section>
 
 <!-- ============ DISCOVER MODAL (overlay) ============ -->
 <div id="discover-modal" class="modal hidden">
@@ -158,107 +156,66 @@
   <div class="essay-inner">
     <h2>How It Works</h2>
     <p>
-      This demo runs a production recommendation engine on a real catalog of
-      <b>74,744 books</b>. Every interaction you had — liking, skipping, saving — fed
-      into the same clustering and serving logic that powers the live app.
+      A real <b>74,744-book</b> catalog, the same production recommender as the live Android app —
+      but your taste lives only in this tab (refresh = reset). No backend, no user rows.
     </p>
 
-    <h3>Book Embeddings</h3>
+    <h3>1 — Book embeddings \( \mathbf{v}\in\mathbb{R}^{768} \)</h3>
     <p>
-      Each book is converted into a 768-dimensional vector using two models working
-      together. <b>SigLIP 2</b> (a vision-language model from Google) encodes the cover
-      art into a dense representation. <b>bge-base</b> (a text embedding model from BAAI)
-      encodes the title, author, and description. These two signals are blended into a
-      single 768-d vector and stored in <b>pgvector</b> (a Postgres extension for
-      vector similarity search). Books with similar covers, themes, or writing style
-      end up close together in this space — that's what every faint dot on the map
-      represents.
+      Cover art via <b>SigLIP 2</b> (vision-language) + title/author/description via <b>bge-base</b>
+      (text) are fused into one L2-normalized 768-d vector per book and indexed in
+      <b>pgvector HNSW</b> (binary-quantized). Similar books are close under cosine distance
+      \( d_{\cos}=1-\cos(\mathbf{a},\mathbf{b})\). The map below shows the same vectors after
+      UMAP to 3D.
     </p>
 
-    <h3>Dynamic Taste Clustering</h3>
+    <h3>2 — Taste that drifts (max 5 clusters + 1 disliked)</h3>
     <p>
-      When you like or save a book, its vector is compared against your existing taste
-      clusters. If it's close enough (cosine distance &le; 0.45), it merges into the
-      nearest cluster with a <b>weight-scaled L2-normalized</b> update
-      (<code>centroid = normalize(centroid·w<sub>old</sub> + vec·1)</code>); if it's
-      too far, a new cluster is created. Up to <b>5 clusters</b> coexist — so enjoying
-      both science fiction and romance doesn't collapse into a single average. Each
-      cluster's weight decays by <b>0.95</b> per taste signal so old preferences fade
-      unless reinforced; the least-recently-used cluster is evicted at capacity. A
-      separate <b>disliked centroid</b> (decay <b>0.90</b>, penalty <b>0.35</b>) tracks
-      your "Not for me" signals so the scorer can push similar books down without
-      polluting taste. Onboarding unions the <b>sub1..5</b> sub-centroids for each
-      chosen genre and k-means them to ≤5 with the same <code>_kmeans_halfvec</code>
-      spread init — the same code the live Android app uses.
+      Every <b>Like / Save / Interested</b> pushes your taste; <b>Not for me</b> pushes a separate
+      disliked centroid. Onboarding just seeds the same machinery using the genre anchors'
+      <code>sub1..5</code> sub-centroids.
+    </p>
+    <p>Merge or create:</p>
+    \[ d_{\cos}(\mathbf{v}, \mathbf{c}_{\text{nearest}}) \le 0.45 \;\Rightarrow\; \text{merge, else new cluster} \]
+    \[ \mathbf{c}_{\text{new}} = \operatorname{normalize}\big(\,w_{\text{old}}\mathbf{c}_{\text{old}} + 1\cdot\mathbf{v}\,\big),\quad w_{\text{new}}=w_{\text{old}}+1 \]
+    \[ w_i \leftarrow 0.95\,w_i\ \text{on every taste signal (decay)},\quad |\mathcal{C}|\le 5\ \text{(LRU evict at cap)} \]
+    \[ \mathbf{c}_{\text{dis}} \leftarrow \operatorname{normalize}(0.90\,\mathbf{c}_{\text{dis}}+\mathbf{v}),\quad w_{\text{dis}}\leftarrow 0.90\,w_{\text{dis}}+1 \]
+    <p>
+      Onboarding: union all <code>sub1..5</code> for picked genres + any loved-book vectors → k-means
+      (\(k=\min(5,|seeds|)\), spread init \(i\cdot n/k\)) → \(\le 5\) centroids. Identical to prod
+      <code>_apply_taste_signal</code> / <code>_apply_disliked_signal</code> / <code>_kmeans_halfvec</code>.
     </p>
 
-    <h3>Unified Scoring + MMR</h3>
+    <h3>3 — Unified scoring + MMR (no distance rings)</h3>
     <p>
-      The retired distance-ring model is gone. Every candidate is now scored with a
-      single <code>_recommend_score</code> and then diversity-reranked with
-      <code>_mmr_rerank</code> — identical to production
-      (<code>20260902000000_unified_mmr_recommendations.sql</code>):
+      Warm users pull from <code>taste + exploration</code>; cold users from <code>trending + exploration</code>.
+      Taste = ANN against top-3 clusters; trending/exploration = quality random pool. Every candidate is scored once:
     </p>
+    \[ \text{score}(\mathbf{v}, s)=\;w_t\,t + w_g\,g + w_q\,q + w_f\,f,\quad (w_t,w_g,w_q,w_f)=\begin{cases} (0.45,0.25,0.20,0.10) & s=\text{taste}\\ (0.25,0.15,0.45,0.15) & s=\text{trending}\\ (0.20,0.10,0.15,0.55) & s=\text{exploration} \end{cases} \]
     <ul>
-      <li><b>Taste</b> books come from ANN nearest against your top-3 clusters;
-        <b>trending</b> and <b>exploration</b> come from the quality random pool.
-        Warm users get <code>taste + exploration</code>, cold users get
-        <code>trending + exploration</code>.</li>
-      <li><b>Score</b> per source: taste 0.45/0.25/0.20/0.10
-        (taste/genre/quality/freshness), trending 0.25/0.15/0.45/0.15,
-        exploration 0.20/0.10/0.15/0.55. Taste similarity is max cosine to any
-        positive cluster minus <code>0.35·sim(disliked)</code>; genre match is 1 if
-        the book shares a picked genre; quality mixes normalized rating +
-        log<sub>10</sub>(ratings_count) + NYT boost; freshness is
-        <code>1/(1+ln(1+shown_count))</code> so seen books sink.</li>
-      <li><b>MMR</b> reranks the top-scored pool:
-        <code>mmr = λ·score − (1−λ)·maxSimToPicked</code>. λ is
-        coverage-driven — <code>0.25 + 0.65·max(0,1−cov/0.01)</code> clamped to
-        <b>0.35–0.85</b> (high diversity when you've seen little, more relevance
-        as coverage grows; cold users floor at 0.55). The pipeline card shows
-        the exact λ, sources, and picked counts for your feed.</li>
+      <li>\(t = \max_{c\in\mathcal{C}}\cos(\mathbf{v},c) - 0.35\cdot\max(0,\cos(\mathbf{v},\mathbf{c}_{\text{dis}}))\) — taste after disliked penalty</li>
+      <li>\(g = \mathbf{1}[\,\text{book genres}\cap\text{picked genres}\neq\varnothing\,]\) — genre match (0/1)</li>
+      <li>\(q = 0.4\frac{r}{5}+0.4\min(\frac{\log_{10}N}{5},1)+0.2\mathbf{1}_{\text{NYT}}\) — rating \(r\), count \(N\)</li>
+      <li>\(f = \frac{1}{1+\ln(1+\text{shown})}\) — freshness sinks repeatedly shown books</li>
     </ul>
     <p>
-      No hard ring percentages — the balance of relevance vs. discovery falls out
-      of the weights + MMR, with the strict quality gate still applied via the
-      quality component.
+      Top-scored pool is then diversity-reranked with Maximal Marginal Relevance:
+    </p>
+    \[ \text{MMR}(\mathbf{v}) = \lambda\cdot\text{score}(\mathbf{v}) - (1-\lambda)\cdot\max_{\mathbf{p}\in\text{picked}}\cos(\mathbf{v},\mathbf{p}) \]
+    \[ \lambda = \operatorname{clip}_{[0.35,0.85]}\!\big(0.25+0.65\max(0,1-\tfrac{\text{cov}}{0.01})\big),\quad \text{cov}=\tfrac{|\text{seen}|}{74\,730},\quad \lambda\ge 0.55\ \text{if cold} \]
+    <p>
+      Small \(\text{cov}\) → low \(\lambda\) → more exploration; as you consume, \(\lambda\) rises toward relevance.
+      The “How This Feed Was Built” card shows the exact \(\lambda\), sources, and picks.
     </p>
 
-    <h3>Quality Gates</h3>
+    <h3>4 — Quality gate (Strict, always on)</h3>
     <p>
-      Every candidate book passes through the same strict quality gate before it can
-      appear in a feed. A book qualifies if it has <b>5,000+ ratings</b>, is a
-      <b>NYT bestseller</b>, is manga rated <b>&ge; 4.0</b>, or comes from the
-      curated catalog scrape. There is no relaxed mode and no cold-start exception —
-      the bar is identical for every user, on every feed, so low-quality or obscure
-      books never crowd out strong ones.
+      A book must satisfy one of: \(\ge 5{,}000\) ratings, NYT bestseller, manga \(\ge 4.0\), or curated scrape.
+      No relaxed fallback, no cold-start bypass — same gate that feeds <code>_recommend_score</code>'s \(q\) term.
     </p>
 
-    <h3>The Vector Space Map</h3>
-    <p>
-      The map is a 2D projection (PCA) of the full 768-dimensional book space.
-      It preserves relative distances — books that are close on the map are
-      semantically similar. The background scatter shows the overall shape of
-      the catalog. Your explored books appear as colored dots (green for likes,
-      indigo for interested, red for skips). The taste clusters are larger indigo
-      blobs whose size reflects weight. The drift trails show how clusters move
-      as you interact — each point is a snapshot of the centroid position after
-      a signal.
-    </p>
-
-    <h3>Technology Stack</h3>
-    <p>
-      This is a fully static, no-backend demo. The frontend is vanilla JavaScript
-      that renders covers straight from Cloudflare R2 and calls read-only
-      <b>Supabase RPCs</b> running against the real catalog stored in
-      <b>pgvector</b> with a binary-quantized <b>HNSW</b> index (sub-millisecond
-      ANN search). The book vectors are pre-computed with <b>SigLIP 2</b> +
-      <b>bge-base</b> (768-d). Your taste profile (5 clusters + disliked centroid)
-      lives <b>only in your browser memory</b> for this session — it is never
-      stored or sent anywhere — and the feed is assembled client-side from the
-      same <b>unified scoring + MMR</b> logic the live Android app uses
-      (coverage-driven λ, per-source weights, scored pools → MMR rerank). Refresh
-      the page and the taste resets. Cover images come from Cloudflare R2.
+    <p class="hint" style="margin-top:18px">
+      Stack: vanilla JS + Supabase read-only RPCs (<code>match_books_nearest</code>, <code>random_popular_seed</code>, <code>get_genre_anchors</code>) over pgvector HNSW · covers from Cloudflare R2 · taste in <code>sessionStorage</code> only. Prod SQL: <code>20260902000000_unified_mmr_recommendations.sql</code>.
     </p>
   </div>
 </section>

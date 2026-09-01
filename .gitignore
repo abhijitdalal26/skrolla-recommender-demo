@@ -3,8 +3,8 @@
 .demo_service_role_key
 *.service_role_key
 
-# Heavy/local data copied during setup
-static/embedding_3d.json
+# Heavy data — embedding_3d.json IS intentionally tracked for Vercel deploy (13 MB)
+# (keep other heavy locals ignored here if needed)
 
 # OS / editor
 .DS_Store

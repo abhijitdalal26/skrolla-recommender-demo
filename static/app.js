@@ -571,7 +571,54 @@ async function init() {
     else if (e.key === "ArrowUp" || e.key === "PageUp") { e.preventDefault(); moveFeed(-1); }
   });
   renderState(); renderClusters(); renderSignals();
-  await fetchFeed();
+  // Gated feed — don't auto-fetch on landing. User must Apply onboarding first.
+  renderFeed();
+  renderPipeline(null, mode);
+  setupInfiniteScroll();
+  setupFypScroll();
+}
+
+let infiniteObserver = null;
+function setupInfiniteScroll() {
+  const sentinel = $("infinite-sentinel");
+  if (!sentinel || infiniteObserver) return;
+  infiniteObserver = new IntersectionObserver((entries) => {
+    for (const e of entries) {
+      if (!e.isIntersecting) continue;
+      if (fetching || !state.has_taste) continue;
+      // Don't trigger for FYP (viewer is paged) or search (user types)
+      if (mode === "fyp" || mode === "search") continue;
+      // For disc/picked: if we have a feed, auto pull when sentinel visible
+      if (feed.length) loadMore();
+    }
+  }, { rootMargin: "400px 0px" });
+  infiniteObserver.observe(sentinel);
+}
+let fypWheelAccum = 0; let fypWheelTimer = null;
+function setupFypScroll() {
+  const viewerWrap = $("feed-viewer");
+  if (!viewerWrap) return;
+  const viewer = $("viewer");
+  // wheel on viewer navigates feed
+  viewer.addEventListener("wheel", (e) => {
+    if (mode !== "fyp" || !feed.length) return;
+    e.preventDefault();
+    fypWheelAccum += e.deltaY;
+    clearTimeout(fypWheelTimer);
+    fypWheelTimer = setTimeout(() => {
+      if (fypWheelAccum > 20) moveFeed(1);
+      else if (fypWheelAccum < -20) moveFeed(-1);
+      fypWheelAccum = 0;
+    }, 80);
+  }, { passive: false });
+  // touch swipe
+  let tStartY = 0;
+  viewer.addEventListener("touchstart", (e) => { tStartY = e.touches[0].clientY; }, { passive: true });
+  viewer.addEventListener("touchend", (e) => {
+    const dy = e.changedTouches[0].clientY - tStartY;
+    if (Math.abs(dy) < 40) return;
+    if (dy < 0) moveFeed(1); else moveFeed(-1);
+  }, { passive: true });
 }
 
 async function refresh() {
@@ -649,8 +696,16 @@ function switchMode(m) {
   $("search-out").classList.toggle("hidden", !isSearch);
   $("search-bar").classList.toggle("hidden", !isSearch);
   $("more-btn").classList.toggle("hidden", isSearch);
-  if (isSearch) { $("right-search").focus(); return; }
+  if (isSearch) { $("right-search").focus(); if (!state.has_taste && !feed.length) { $("search-out").innerHTML = `<div class="empty">Search above — no onboarding needed.</div>`; } return; }
   if (m === "picked") { fetchPicked(); return; }
+  // Gate FYP/Daily Discovery until onboarding applied
+  if (!state.has_taste) {
+    feed = [];
+    feedIndex = 0;
+    renderFeed();
+    renderPipeline(null, m);
+    return;
+  }
   fetchFeed();
 }
 
@@ -756,11 +811,12 @@ async function reset() {
   feed = []; selectedGenres.clear(); lovedBooks.clear(); histStack = []; lastSeed = 0; feedIndex = 0;
   $("onboarding-note").textContent = "";
   $("genre-grid").querySelectorAll(".genre-chip").forEach((el) => el.classList.remove("sel"));
+  $("apply-onboarding").disabled = true;
   updateGenreChips();
   renderChips(); renderFeed(); renderPipeline(null, mode);
   closeDiscover();
   renderState(); renderClusters(); renderSignals();
-  await fetchFeed();
+  // stay gated — don't auto fetch after reset
 }
 
 async function onSearch() {
@@ -974,6 +1030,10 @@ function moveFeed(dir) {
   viewer.innerHTML = cardHtml(f, true);
   $("viewer-counter").textContent = `${feedIndex + 1} / ${feed.length}`;
   attachActions(viewer);
+  // auto-prefetch when near end (last 3 cards)
+  if (feedIndex >= feed.length - 3 && !fetching && state.has_taste) {
+    loadMore();
+  }
 }
 
 function displayTitle(f, fyp) {

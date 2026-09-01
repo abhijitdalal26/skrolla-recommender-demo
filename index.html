@@ -1,0 +1,312 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>How Skrolla Works — Interactive Demo</title>
+<meta name="description" content="An interactive demo of a real-time book recommendation engine. Pick genres, watch taste clusters form and drift in vector space.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Newsreader:ital,opsz,wght@0,6..72,400;0,6..72,500;0,6..72,600;0,6..72,700;1,6..72,400&family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="static/style.css">
+</head>
+<body>
+
+<!-- ============ HEADER ============ -->
+<header id="demo">
+  <div class="header-left">
+    <h1>How Skrolla <span>Works</span></h1>
+  </div>
+  <button id="reset-btn" class="ghost" title="Reset the simulated user">Reset</button>
+  <div class="header-meta">
+    <span id="state-badges" class="badges"></span>
+  </div>
+</header>
+
+<!-- ============ MAIN 3-COLUMN: Onboarding | Feed Viewer | Signals ============ -->
+<main class="cols">
+  <!-- LEFT: onboarding + loved books search -->
+  <section class="col col-left">
+    <div class="card">
+      <h2>1. Pick your genres</h2>
+      <p class="hint">Choose at least one, then continue.</p>
+      <div id="genre-grid" class="genre-grid"></div>
+    </div>
+
+    <div class="card loved-card">
+      <h2>2. Add books you've read or know</h2>
+      <p class="hint">Add a few, then hit Apply.</p>
+      <div class="search-box">
+        <input id="search-input" type="text" placeholder="Search book titles...">
+        <div id="search-results" class="search-results"></div>
+      </div>
+      <div id="loved-chips" class="chips"></div>
+      <button id="apply-onboarding" disabled>Apply onboarding</button>
+      <p id="onboarding-note" class="note"></p>
+    </div>
+  </section>
+
+  <!-- MIDDLE: feed viewer (TikTok-style) -->
+  <section class="col col-middle">
+    <div class="card feed-head">
+      <div class="tabs">
+        <button id="tab-fyp" class="tab active">For You</button>
+        <button id="tab-disc" class="tab">Daily Discovery</button>
+        <button id="tab-picked" class="tab">Picked for you</button>
+        <button id="tab-search" class="tab">Search</button>
+      </div>
+      <button id="more-btn">Pull more</button>
+    </div>
+
+    <div id="search-bar" class="search-bar hidden">
+      <input id="right-search" type="text" placeholder="Search books by title...">
+      <div id="search-count" class="hint"></div>
+    </div>
+
+    <!-- For You: TikTok-style single-book viewer -->
+    <div id="feed-viewer" class="feed fyp">
+      <div class="viewer-wrap">
+        <div class="nav-col">
+          <button id="prev-btn" class="nav-arrow up" title="Previous book">&#9650;</button>
+          <button id="next-btn" class="nav-arrow down" title="Next book">&#9660;</button>
+        </div>
+        <div id="viewer" class="viewer"></div>
+      </div>
+      <div id="viewer-counter" class="viewer-counter"></div>
+    </div>
+
+    <!-- Grid feeds -->
+    <div id="feed" class="feed disc hidden"></div>
+    <div id="picked" class="feed disc hidden"></div>
+    <div id="search-out" class="feed disc hidden"></div>
+  </section>
+
+  <!-- RIGHT: signal history + pipeline -->
+  <section class="col col-right">
+    <div class="card">
+      <h2>Signal History</h2>
+      <div id="signal-list" class="signal-list"></div>
+    </div>
+    <div class="card">
+      <h2>Session</h2>
+      <div id="session-list" class="session-list"></div>
+    </div>
+    <div class="card">
+      <h2>How This Feed Was Built</h2>
+      <div id="pipeline-empty" class="hint">Pick genres and apply to see how this feed was built.</div>
+      <div id="pipeline"></div>
+    </div>
+  </section>
+</main>
+
+<!-- ============ MAP + CLUSTERS (side by side) ============ -->
+<section class="map-section">
+  <div class="map-clusters-wrap">
+    <div class="card clusters-side-card">
+      <h2>Taste Clusters</h2>
+      <p id="cluster-empty" class="hint">Select genres above to create taste clusters.</p>
+      <div id="cluster-list"></div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ DISCOVER MODAL (overlay) ============ -->
+<div id="discover-modal" class="modal hidden">
+  <div class="modal-backdrop"></div>
+  <div class="modal-content">
+    <button id="discover-close" class="modal-close">&times;</button>
+    <div class="discover-book"></div>
+  </div>
+</div>
+
+<!-- ============ 3D EMBEDDING SPACE ============ -->
+<section class="embedding-3d-section">
+  <div class="container">
+    <h2>The Full Embedding Space</h2>
+    <p class="proj-desc">
+      Every book in the catalog — <b>67,736 of them</b> — projected from 768 dimensions
+      into 3D using PCA followed by UMAP (<i>n</i>=30, cosine), colored by dominant
+      canonical genre. Each dot is one book at its real 3D position, so distance
+      between dots reflects how close the books really are in vector space. Three
+      ways to look at the same space: <b>3D Scatter</b> plots every book as a dot at
+      its true 3D location; <b>Hills</b> raises a surface where books crowd together
+      (density); <b>Flat</b> shows just the genre regions from above. Drag to rotate,
+      scroll to zoom, hover a dot to see the book.
+    </p>
+    <div id="embedding-3d-stats" class="hint"></div>
+    <div class="embedding-3d-legend" id="embedding-3d-legend"></div>
+    <div class="view-controls">
+      <label for="view-select">View
+        <select id="view-select" class="view-select">
+          <option value="continuous" selected>3D Scatter</option>
+          <option value="hills">Hills</option>
+          <option value="flat">Flat</option>
+        </select>
+      </label>
+      <label><input type="checkbox" id="show-book-names" checked> Book names</label>
+    </div>
+    <div id="embedding-3d-wrap" class="embedding-3d-wrap">
+      <div id="embedding-3d-loading" class="embedding-3d-loading">Scrolling into view…</div>
+      <canvas id="embedding-3d"></canvas>
+      <canvas id="embedding-3d-surface" style="display:none"></canvas>
+    </div>
+  </div>
+</section>
+
+<!-- ============ ESSAY SECTION ============ -->
+<section class="essay-section">
+  <div class="essay-inner">
+    <h2>How It Works</h2>
+    <p>
+      This demo runs a production recommendation engine on a real catalog of
+      <b>74,744 books</b>. Every interaction you had — liking, skipping, saving — fed
+      into the same clustering and serving logic that powers the live app.
+    </p>
+
+    <h3>Book Embeddings</h3>
+    <p>
+      Each book is converted into a 768-dimensional vector using two models working
+      together. <b>SigLIP 2</b> (a vision-language model from Google) encodes the cover
+      art into a dense representation. <b>bge-base</b> (a text embedding model from BAAI)
+      encodes the title, author, and description. These two signals are blended into a
+      single 768-d vector and stored in <b>pgvector</b> (a Postgres extension for
+      vector similarity search). Books with similar covers, themes, or writing style
+      end up close together in this space — that's what every faint dot on the map
+      represents.
+    </p>
+
+    <h3>Dynamic Taste Clustering</h3>
+    <p>
+      When you interact with a book (like, save, skip), its vector is compared against
+      your existing taste clusters. If it's close enough (cosine distance &le; 0.45),
+      it merges into the nearest cluster, pulling the centroid toward it. If it's too
+      far, a new cluster is created. Up to <b>5 clusters</b> coexist — so enjoying
+      both science fiction and romance doesn't collapse into a single average. Each
+      cluster has a weight that decays over time (0.95 per interaction), so old
+      preferences naturally fade unless reinforced. The indigo blobs on the map show
+      where these clusters sit in vector space, and the drift trails show how they
+      move as your taste evolves.
+    </p>
+
+    <h3>Distance-Ring Serving</h3>
+    <p>
+      Every book in your feed is placed into one of three distance rings, each
+      with a different purpose:
+    </p>
+    <ul>
+      <li><b>Inner (50%)</b> — exact nearest-neighbor search against your top-2
+        taste cluster centroids plus one random cluster. These are the books
+        closest to what you've already enjoyed.</li>
+      <li><b>Middle (30%)</b> — books at a deliberate mid-distance (0.30–0.55
+        cosine) from your taste centroid. This is how the engine introduces you
+        to new genres and authors without going completely random.</li>
+      <li><b>Outer (20%)</b> — highly-rated crowd favorites (avg rating &ge; 4.0)
+        picked from the random quality pool. These keep the feed grounded.</li>
+    </ul>
+    <p>
+      Every book must pass the strict quality gate (ratings &ge; 5000, NYT
+      bestseller, manga &ge; 4.0, or scraped). The pipeline card above shows the
+      exact allocation for your current feed.
+    </p>
+
+    <h3>Quality Gates</h3>
+    <p>
+      Every candidate book passes through the same strict quality gate before it can
+      appear in a feed. A book qualifies if it has <b>5,000+ ratings</b>, is a
+      <b>NYT bestseller</b>, is manga rated <b>&ge; 4.0</b>, or comes from the
+      curated catalog scrape. There is no relaxed mode and no cold-start exception —
+      the bar is identical for every user, on every feed, so low-quality or obscure
+      books never crowd out strong ones.
+    </p>
+
+    <h3>The Vector Space Map</h3>
+    <p>
+      The map is a 2D projection (PCA) of the full 768-dimensional book space.
+      It preserves relative distances — books that are close on the map are
+      semantically similar. The background scatter shows the overall shape of
+      the catalog. Your explored books appear as colored dots (green for likes,
+      indigo for interested, red for skips). The taste clusters are larger indigo
+      blobs whose size reflects weight. The drift trails show how clusters move
+      as you interact — each point is a snapshot of the centroid position after
+      a signal.
+    </p>
+
+    <h3>Technology Stack</h3>
+    <p>
+      This is a fully static, no-backend demo. The frontend is vanilla JavaScript
+      that renders covers straight from Cloudflare R2 and calls read-only
+      <b>Supabase RPCs</b> running against the real catalog stored in
+      <b>pgvector</b> with a binary-quantized <b>HNSW</b> index (sub-millisecond
+      ANN search). The book vectors are pre-computed with <b>SigLIP 2</b> +
+      <b>bge-base</b> (768-d). Your taste profile lives <b>only in your browser
+      memory</b> for this session — it is never stored or sent anywhere — and the
+      feed is assembled client-side from the same distance-ring logic the live app
+      uses. Refresh the page and the taste resets. Cover images come from
+      Cloudflare R2.
+    </p>
+  </div>
+</section>
+
+<!-- ============ FOOTER ============ -->
+<footer class="site-footer">
+  <p>Built as a portfolio project to demonstrate real-time recommendation systems.</p>
+</footer>
+
+<!-- Canvas hover tooltip -->
+<div id="canvas-tooltip" class="canvas-tooltip hidden"></div>
+
+<!-- 3D hover tooltip -->
+<div id="embedding-3d-tooltip" class="canvas-tooltip hidden"></div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+  }
+}
+</script>
+<script type="module" src="static/embedding_3d.js"></script>
+<script type="module" src="static/embedding_3d_surface.js"></script>
+<script type="module">
+  // View switcher: three mutually-exclusive views over the same embedding data.
+  // Each renderer is an independent module exposing window.__continuous and
+  // window.__surface. The active view id is shared via window.__embeddingView so
+  // modules that finish lazy-loading late can show themselves if selected.
+  const contCanvas = document.getElementById("embedding-3d");
+  const surfCanvas = document.getElementById("embedding-3d-surface");
+  const viewSelect = document.getElementById("view-select");
+  let current = "continuous";
+  window.__embeddingView = current;
+
+  function showView(v) {
+    if (v !== "hills" && v !== "flat") v = "continuous";
+    current = v;
+    window.__embeddingView = v;
+
+    contCanvas.style.display = v === "continuous" ? "block" : "none";
+    surfCanvas.style.display = (v === "hills" || v === "flat") ? "block" : "none";
+
+    if (v === "continuous") {
+      window.__continuous && window.__continuous.show();
+      window.__surface && window.__surface.hide();
+    } else {
+      window.__continuous && window.__continuous.hide();
+    }
+    if (v === "hills" || v === "flat") {
+      window.__surface && window.__surface.setMode(v);
+      window.__surface && window.__surface.show();
+    } else {
+      window.__surface && window.__surface.hide();
+    }
+  }
+
+  viewSelect.addEventListener("change", (e) => showView(e.target.value));
+  document.getElementById("show-book-names").addEventListener("change", (e) => {
+    window.__showBookNames = e.target.checked;
+  });
+</script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+<script src="static/app.js"></script>
+</body>
+</html>

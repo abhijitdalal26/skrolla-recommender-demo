@@ -1,0 +1,19 @@
+# Secrets — never commit
+.env
+.demo_service_role_key
+*.service_role_key
+
+# Heavy/local data copied during setup
+static/embedding_3d.json
+
+# OS / editor
+.DS_Store
+Thumbs.db
+
+# Python
+__pycache__/
+*.pyc
+
+# Vercel / node
+node_modules/
+.vercel

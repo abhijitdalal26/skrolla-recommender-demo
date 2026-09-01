@@ -1,4 +1,4 @@
-/* 3D embedding visualizer — continuous surface ("hill landscape") view.
+/* 3D embedding visualizer - continuous surface ("hill landscape") view.
    Lazy-loaded on scroll into view, separately from the dot-cloud view.
    Renders the same 67,736 books as a continuous sheet: a grid over the
    UMAP (x,z) plane where each cell's HEIGHT = book density (dense genre

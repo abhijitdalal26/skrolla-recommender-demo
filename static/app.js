@@ -1,4 +1,4 @@
-/* Skrolla Recommender — static demo with browser-side taste.
+/* Skrolla Recommender, static demo with browser-side taste.
  *
  * Unlike the offline Flask sim, this is a fully static site:
  *   - Covers stream from Cloudflare R2.
@@ -470,7 +470,7 @@ async function buildFeed() {
   let uniq = [...uniqMap.values()];
 
   // blacklist + seen + Strict quality gate (prod _quality_gate, strict = 34.6k pass)
-  // Search tab bypasses this — feeds (FYP/Daily/Picked) are Strict only.
+  // Search tab bypasses this, feeds (FYP/Daily/Picked) are Strict only.
   let gatedOut = 0;
   uniq = uniq.filter((r) => {
     const k2 = r.isbn13 || r.isbn;
@@ -585,7 +585,7 @@ async function init() {
     else if (e.key === "ArrowUp" || e.key === "PageUp") { e.preventDefault(); moveFeed(-1); }
   });
   renderState(); renderClusters(); renderSignals();
-  // Gated feed — don't auto-fetch on landing. User must Apply onboarding first.
+  // Gated feed, don't auto-fetch on landing. User must Apply onboarding first.
   renderFeed();
   renderPipeline(null, mode);
   setupInfiniteScroll();
@@ -711,7 +711,7 @@ function switchMode(m) {
   $("search-out").classList.toggle("hidden", !isSearch);
   $("search-bar").classList.toggle("hidden", !isSearch);
   $("more-btn").classList.toggle("hidden", isSearch);
-  if (isSearch) { $("right-search").focus(); if (!state.has_taste && !feed.length) { $("search-out").innerHTML = `<div class="empty">Search above — no onboarding needed.</div>`; } return; }
+  if (isSearch) { $("right-search").focus(); if (!state.has_taste && !feed.length) { $("search-out").innerHTML = `<div class="empty">Search above, no onboarding needed.</div>`; } return; }
   if (m === "picked") { fetchPicked(); return; }
   // Gate FYP/Daily Discovery until onboarding applied
   if (!state.has_taste) {
@@ -831,7 +831,7 @@ async function reset() {
   renderChips(); renderFeed(); renderPipeline(null, mode);
   closeDiscover();
   renderState(); renderClusters(); renderSignals();
-  // stay gated — don't auto fetch after reset
+  // stay gated, don't auto fetch after reset
 }
 
 async function onSearch() {
@@ -888,7 +888,6 @@ function renderState() {
   const b = [];
   b.push(`<span class="badge ${state.has_taste ? "warm" : ""}">taste: ${state.has_taste ? "built" : "empty"}</span>`);
   b.push(`<span class="badge warm">unified scoring + MMR</span>`);
-  b.push(`<span class="badge warm">quality: ${QUALITY_TAG_STRICT}</span>`);
   $("state-badges").innerHTML = b.join("");
   renderSession();
 }
@@ -896,19 +895,19 @@ function renderState() {
 function renderSession() {
   if (!state) return;
   const covPct = (state.coverage * 100).toFixed(2);
-  const dislikedW = state.disliked ? state.disliked.weight.toFixed(2) : "—";
+  const dislikedW = state.disliked ? state.disliked.weight.toFixed(2) : "-";
   const rows = [
     ["Coverage", `${covPct}%`],
     ["Signals", `${state.total_swipes}`],
     ["Positive", `${state.positive_signals}`],
     ["Clusters", `${state.clusters.length} / 5`],
     ["Disliked w", `${dislikedW}`],
-    ["Lambda", `${(state.allocation && state.allocation.lambda != null) ? state.allocation.lambda : "—"}`],
+    ["Lambda", `${(state.allocation && state.allocation.lambda != null) ? state.allocation.lambda : "-"}`],
   ];
   $("session-list").innerHTML = rows.map(([k, v]) =>
     `<div class="session-row"><span class="k">${k}</span><span class="v">${v}</span></div>`
   ).join("") +
-  `<div class="session-tip">Coverage — seen / catalog. Lambda — MMR diversity (0.35 relevance → 0.85 explore). Disliked w — accumulated negative centroid weight (decay 0.90).</div>`;
+  `<div class="session-tip">Coverage, seen / catalog. Lambda, MMR diversity (0.35 relevance → 0.85 explore). Disliked w, accumulated negative centroid weight (decay 0.90).</div>`;
 }
 
 function renderClusters() {

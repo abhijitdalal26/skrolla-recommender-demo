@@ -1,4 +1,4 @@
-/* 3D embedding visualizer — real 3D point cloud.
+/* 3D embedding visualizer - real 3D point cloud.
    Lazy-loaded on scroll into view. Renders every book as a single dot at its
    actual 3D UMAP position (x, y, z), colored by dominant canonical genre. This
    shows the books' true vector-space geometry (how far apart things really are

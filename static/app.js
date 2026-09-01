@@ -34,8 +34,18 @@ const MAX_CLUSTERS = 5;
 const TASTE_DECAY = 0.95;     // per taste-signal weight decay (_apply_taste_signal)
 const DISLIKED_DECAY = 0.90;  // per disliked-signal decay (_apply_disliked_signal)
 const DISLIKED_PENALTY_W = 0.35;
-const QUALITY_TAG_STRICT = "Strict";
+const QUALITY_TAG_STRICT = "Strict · 34.6k";
 const TOTAL_CATALOG = 74730;  // approx, for coverage_frac
+const STRICT_CATALOG = 34655; // prod _quality_gate strict pass (34.6k / 74.7k)
+
+// prod _quality_gate strict: ratings>=5000 OR is_nyt OR (manga + avg>=4.0)
+function passesStrictGate(b) {
+  if (!b) return false;
+  if (b.ratings_count != null && b.ratings_count >= 5000) return true;
+  if (b.is_nyt_bestseller) return true;
+  if (String(b.src).toLowerCase() === "manga" && b.avg_rating != null && b.avg_rating >= 4.0) return true;
+  return false;
+}
 
 let sb = null;
 let state = null;
@@ -459,10 +469,14 @@ async function buildFeed() {
   }
   let uniq = [...uniqMap.values()];
 
-  // blacklist filter + seen filter (server already filtered by seen, but double-check)
+  // blacklist + seen + Strict quality gate (prod _quality_gate, strict = 34.6k pass)
+  // Search tab bypasses this — feeds (FYP/Daily/Picked) are Strict only.
+  let gatedOut = 0;
   uniq = uniq.filter((r) => {
     const k2 = r.isbn13 || r.isbn;
-    return !state.blacklist.has(k2) && !state.seen.has(k2);
+    if (state.blacklist.has(k2) || state.seen.has(k2)) return false;
+    if (!passesStrictGate(r)) { gatedOut++; return false; }
+    return true;
   });
 
   // score each candidate per its source weights
@@ -656,7 +670,8 @@ async function fetchPicked() {
     r.forEach((x) => { x.__source = "taste"; });
     rows.push(...r);
   }
-  const uniq = dedupe(rows);
+  let uniq = dedupe(rows);
+  uniq = uniq.filter(passesStrictGate);
   // score + MMR
   const scored = uniq.map((r) => {
     const vec = toVec(r.combined_vec);

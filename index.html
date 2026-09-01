@@ -208,10 +208,13 @@
       The “How This Feed Was Built” card shows the exact \(\lambda\), sources, and picks.
     </p>
 
-    <h3>4 — Quality gate (Strict, always on)</h3>
+    <h3>4 — Quality gate (Strict, feed-only)</h3>
     <p>
-      A book must satisfy one of: \(\ge 5{,}000\) ratings, NYT bestseller, manga \(\ge 4.0\), or curated scrape.
-      No relaxed fallback, no cold-start bypass — same gate that feeds <code>_recommend_score</code>'s \(q\) term.
+      <b>Feeds</b> (For You / Daily / Picked) are <b>Strict</b> — identical to prod
+      <code>_quality_gate</code>: \(\text{ratings}\ge 5{,}000 \;\; \lor\;\; \text{NYT} \;\; \lor\;\; (\text{manga}\land r\ge 4.0)\).
+      Only <b>34,655 / 74,730</b> books (~46%) pass and can appear in feeds. The rest are
+      <b>search-only</b> — use the <b>Search</b> tab to find any title by name, even below the gate.
+      No relaxed fallback, no cold-start bypass. Search <i>does not</i> apply the gate.
     </p>
 
     <p class="hint" style="margin-top:18px">

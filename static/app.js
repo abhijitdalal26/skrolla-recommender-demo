@@ -9,8 +9,17 @@
  *     memory for this session. It is never stored or sent to the server.
  *     Reload resets it.
  *
- * The distance-ring serving model and dynamic clustering mirror the logic the
- * live app uses (see CHANGELOG 2026-08-26).
+ * Serving model mirrors the PRODUCTION unified recommender
+ * (20260902000000_unified_mmr_recommendations.sql):
+ *   - Scoring: _recommend_score w_taste/w_genre/w_quality/w_freshness
+ *     per source (taste 0.45/0.25/0.20/0.10 · trending 0.25/0.15/0.45/0.15
+ *     · exploration 0.20/0.10/0.15/0.55) + disliked_centroid penalty.
+ *   - Diversity: _mmr_rerank (lambda coverage-driven 0.35-0.85).
+ *   - Sources: taste + exploration when warm, else trending + exploration.
+ *   - Taste dynamics: _apply_taste_signal (decay 0.95, threshold 0.45,
+ *     weight-scaled merge, L2-normalize, LRU evict) + _apply_disliked_signal
+ *     (decay 0.90, separate centroid).
+ *   - Onboarding: union sub1..5 only, _kmeans_halfvec init-spread → ≤5.
  */
 "use strict";
 
@@ -19,12 +28,14 @@ const SUPABASE_URL = "https://hkdtpwbmgmnxhykhgqvb.supabase.co";
 const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImhrZHRwd2JtZ21ueGh5a2hncXZiIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODgyMDUzMzcsImV4cCI6MjEwMzc4MTMzN30.fp3NGMdYZpA1o159ew6xHFdqdPpUMoRBbUD3fH70rCw";
 const COVER_BASE = "https://pub-77f77d9160fd473c8b4e4e7ca1aa2e18.r2.dev";
 
-// ---- taste model constants (mirror reco_engine / production) ----
+// ---- taste model constants (mirror production) ----
 const MERGE_DIST = 0.45;      // cosine distance to merge into a cluster
 const MAX_CLUSTERS = 5;
-const DECAY = 0.95;           // per-interaction weight decay
-const WEIGHTS = { like: 1, save: 1, chat: 1, tap: 0.5, skip: -0.3, not_for_me: -0.5 };
+const TASTE_DECAY = 0.95;     // per taste-signal weight decay (_apply_taste_signal)
+const DISLIKED_DECAY = 0.90;  // per disliked-signal decay (_apply_disliked_signal)
+const DISLIKED_PENALTY_W = 0.35;
 const QUALITY_TAG_STRICT = "Strict";
+const TOTAL_CATALOG = 74730;  // approx, for coverage_frac
 
 let sb = null;
 let state = null;
@@ -35,22 +46,38 @@ let lovedBooks = new Map();
 let lastSeed = 0;
 let feedIndex = 0;
 let genres = [];
-let genreAnchors = {};        // genre -> {mean, sub1..sub5}
-let histStack = [];           // undo history of {snapshot, isbn, signal}
+let genreAnchors = {};        // genre -> {mean_vec, sub1..sub5_vec}
+let histStack = [];           // undo history
 let fetching = false;
 
 const $ = (id) => document.getElementById(id);
 
 // ------------------------------------------------------------------ vector math
 function toVec(s) {
+  if (!s) return null;
   if (Array.isArray(s)) return s;
-  if (typeof s === "string") { try { return JSON.parse(s); } catch { return null; } }
+  if (typeof s === "string") { try { const v = JSON.parse(s); return Array.isArray(v) ? v : null; } catch { return null; } }
   return null;
+}
+function l2Normalize(v) {
+  let s = 0; for (let i = 0; i < v.length; i++) s += v[i] * v[i];
+  const n = Math.sqrt(s);
+  if (n === 0) return v.slice();
+  const out = new Array(v.length);
+  for (let i = 0; i < v.length; i++) out[i] = v[i] / n;
+  return out;
 }
 function dot(a, b) { let s = 0; for (let i = 0; i < a.length; i++) s += a[i] * b[i]; return s; }
 function norm(a) { return Math.sqrt(dot(a, a)) || 1; }
-function cosineDist(a, b) { return 1 - dot(a, b) / (norm(a) * norm(b)); }
-function cosineSim(a, b) { return 1 - cosineDist(a, b); }
+function cosineSim(a, b) {
+  if (!a || !b) return 0;
+  const na = norm(a), nb = norm(b);
+  if (na === 0 || nb === 0) return 0;
+  return dot(a, b) / (na * nb);
+}
+function cosineDist(a, b) { return 1 - cosineSim(a, b); }
+function scaleVec(v, s) { const out = new Array(v.length); for (let i = 0; i < v.length; i++) out[i] = v[i] * s; return out; }
+function addVec(a, b) { const out = new Array(a.length); for (let i = 0; i < a.length; i++) out[i] = a[i] + b[i]; return out; }
 
 // ------------------------------------------------------------------ state
 function freshState() {
@@ -59,18 +86,20 @@ function freshState() {
     coverage: 0,
     total_swipes: 0,
     positive_signals: 0,
-    clusters: [],
+    clusters: [],            // {id, centroid: number[], weight, size, label, genre_dist, updated_at}
+    disliked: null,          // {vec: number[], weight}
+    shownCounts: {},         // isbn -> int (for freshness)
     seen: new Set(),
     blacklist: new Set(),
     tick: 0,
+    nextId: 1,
     signals: [],
-    allocation: { inner_n: 0, middle_n: 0, outer_n: 0, mode: "no-taste", clusters_selected: 0 },
+    allocation: { mode: "no-taste", lambda: 0, coverage: 0, clusters_selected: 0, sources: [] },
     slices: {},
   };
 }
 
 function labelFor(vec) {
-  // nearest canonical genre anchor (by mean_vec) gives the cluster label
   let best = "taste", bestD = Infinity;
   for (const [g, a] of Object.entries(genreAnchors)) {
     const mv = toVec(a.mean_vec);
@@ -81,119 +110,247 @@ function labelFor(vec) {
   return best;
 }
 
-function decayAll() {
-  for (const c of state.clusters) c.weight *= DECAY;
-}
-
-// Add a book vector as a signal. dir=+1 positive, -1 negative.
-function addSignal(vec, dir) {
+// ---- _apply_taste_signal (prod: 20260814050925, decay 0.95, threshold 0.45, weight-scaled merge, LRU) ----
+function applyTasteSignal(vec) {
   if (!vec) return;
-  decayAll();
+  const w = 1;
+  // decay existing weights (deployed does this regardless of outcome, before merge)
+  for (const c of state.clusters) c.weight *= TASTE_DECAY;
+  state.tick += 1;
   let nearest = null, bestD = Infinity;
   for (const c of state.clusters) {
     const d = cosineDist(vec, c.centroid);
     if (d < bestD) { bestD = d; nearest = c; }
   }
   if (nearest && bestD <= MERGE_DIST) {
-    nearest.size += 1;
-    nearest.weight += WEIGHTS[(dir > 0 ? "like" : "skip")];
-    const nw = nearest.size;
-    nearest.centroid = nearest.centroid.map((v, i) => v + (vec[i] - v) / nw);
-  } else if (state.clusters.length < MAX_CLUSTERS) {
+    const oldW = nearest.weight; // already decayed
+    const newW = oldW + w;
+    // weight-scaled merge then L2 normalize (prod: _l2_normalize(centroid*old_w + vec*w))
+    const merged = l2Normalize(addVec(scaleVec(nearest.centroid, oldW), scaleVec(vec, w)));
+    nearest.centroid = merged;
+    nearest.weight = newW;
+    nearest.size = (nearest.size || 1) + 1;
+    nearest.updated_at = state.tick;
+    // label stays as originally assigned; could refresh but keep stable
+  } else {
+    if (state.clusters.length >= MAX_CLUSTERS) {
+      // LRU evict: smallest updated_at (oldest), tie-break smallest weight
+      let evictIdx = 0;
+      for (let i = 1; i < state.clusters.length; i++) {
+        const a = state.clusters[i], b = state.clusters[evictIdx];
+        if (a.updated_at < b.updated_at || (a.updated_at === b.updated_at && a.weight < b.weight)) evictIdx = i;
+      }
+      state.clusters.splice(evictIdx, 1);
+    }
+    const nid = state.nextId++;
     state.clusters.push({
-      id: state.clusters.length,
-      centroid: vec.slice(),
-      weight: dir > 0 ? 1 : -0.5,
+      id: nid,
+      centroid: l2Normalize(vec.slice()),
+      weight: w,
       size: 1,
       label: labelFor(vec),
-      genre_dist: bestD,
+      genre_dist: bestD === Infinity ? 0 : bestD,
+      updated_at: state.tick,
     });
-  } else {
-    // cap reached: reinforce the nearest cluster instead
-    nearest.weight += WEIGHTS[(dir > 0 ? "like" : "skip")];
-    nearest.size += 1;
   }
-  state.clusters.sort((a, b) => Math.abs(b.weight) - Math.abs(a.weight));
+  // prune near-zero
+  state.clusters = state.clusters.filter((c) => c.weight > 1e-9);
+  state.clusters.sort((a, b) => b.weight - a.weight);
+  state.has_taste = state.clusters.length > 0;
+  state.coverage = state.has_taste ? Math.min(1, state.seen.size / TOTAL_CATALOG) : 0;
+}
+
+// ---- _apply_disliked_signal (prod: 20260901041448, decay 0.90, separate centroid) ----
+function applyDislikedSignal(vec) {
+  if (!vec) return;
+  const nvec = l2Normalize(vec.slice());
+  if (!state.disliked) {
+    state.disliked = { vec: nvec, weight: 1 };
+  } else {
+    // prod: v_centroid = scale(old,0.90)+scale(vec,1.0); weight similarly (centroid not normalized in DB)
+    // For cosine scoring direction matters, so we normalize after combining.
+    const scaledOld = scaleVec(state.disliked.vec, DISLIKED_DECAY);
+    let nv = addVec(scaledOld, nvec);
+    nv = l2Normalize(nv);
+    state.disliked.vec = nv;
+    state.disliked.weight = state.disliked.weight * DISLIKED_DECAY + 1;
+  }
+  state.tick += 1;
+}
+
+function kmeansHalfvec(vecs, k) {
+  if (!vecs.length || k === 0) return [];
+  k = Math.min(k, vecs.length);
+  // L2 normalize all
+  const normed = vecs.map((v) => l2Normalize(v));
+  const n = normed.length;
+  // Init: spread picks evenly across the pool (prod _kmeans_halfvec: (i*n)//k)
+  let centroids = [];
+  for (let i = 0; i < k; i++) centroids.push(normed[Math.floor((i * n) / k)].slice());
+  for (let iter = 0; iter < 20; iter++) {
+    const assign = new Array(n).fill(0);
+    for (let i = 0; i < n; i++) {
+      let best = 0, bd = Infinity;
+      for (let c = 0; c < k; c++) {
+        const d = cosineDist(normed[i], centroids[c]);
+        if (d < bd) { bd = d; best = c; }
+      }
+      assign[i] = best;
+    }
+    const newCentroids = centroids.map(() => null);
+    let changed = false;
+    for (let c = 0; c < k; c++) {
+      const members = [];
+      for (let i = 0; i < n; i++) if (assign[i] === c) members.push(normed[i]);
+      if (!members.length) { newCentroids[c] = centroids[c].slice(); continue; }
+      let mean = new Array(normed[0].length).fill(0);
+      for (const m of members) for (let d = 0; d < mean.length; d++) mean[d] += m[d];
+      for (let d = 0; d < mean.length; d++) mean[d] /= members.length;
+      mean = l2Normalize(mean);
+      newCentroids[c] = mean;
+      if (cosineDist(mean, centroids[c]) > 1e-6) changed = true;
+    }
+    centroids = newCentroids;
+    if (!changed) break;
+  }
+  return centroids;
 }
 
 function buildTasteFromOnboarding(genresList, lovedVecs) {
-  // Seed from the chosen genres' sub-centroids (union), like apply_genre_seeds.
+  // Union sub1..5 only (no mean) like prod apply_genre_seeds; kmeans to ≤5.
   const seeds = [];
-  const gDocs = [];
   for (const g of genresList) {
     const a = genreAnchors[g];
     if (!a) continue;
     for (let i = 1; i <= 5; i++) {
       const v = toVec(a["sub" + i + "_vec"]);
-      if (v) { seeds.push(v); gDocs.push(g); }
-    }
-    const m = toVec(a.mean_vec);
-    if (m) { seeds.push(m); gDocs.push(g); }
-  }
-  for (const v of lovedVecs) if (v) { seeds.push(v); gDocs.push("loved"); }
-
-  state.clusters = kmeans(seeds, gDocs, Math.min(MAX_CLUSTERS, Math.max(1, seeds.length)));
-  state.has_taste = state.clusters.length > 0;
-  state.coverage = state.has_taste ? 1 : 0;
-}
-
-function kmeans(points, docs, k) {
-  if (!points.length) return [];
-  k = Math.max(1, Math.min(k, points.length));
-  // farthest-point init
-  const centers = [0];
-  const idxs = new Set([0]);
-  while (centers.length < k) {
-    let best = -1, bestD = -1;
-    for (let i = 0; i < points.length; i++) {
-      if (idxs.has(i)) continue;
-      let md = Infinity;
-      centers.forEach((c) => { const d = cosineDist(points[i], points[c]); if (d < md) md = d; });
-      if (md > bestD) { bestD = md; best = i; }
-    }
-    if (best < 0) break;
-    centers.push(best); idxs.add(best);
-  }
-  const assign = new Array(points.length).fill(0);
-  const ncent = new Array(centers.length).fill(0).map(() => new Array(points[0].length).fill(0));
-  for (let iter = 0; iter < 20; iter++) {
-    assign.fill(0);
-    for (let i = 0; i < points.length; i++) {
-      let bc = 0, bd = Infinity;
-      for (let c = 0; c < centers.length; c++) {
-        const d = cosineDist(points[i], ncent[c].some((x) => x !== 0) ? ncent[c] : points[centers[c]]);
-        if (d < bd) { bd = d; bc = c; }
-      }
-      assign[i] = bc;
-    }
-    const sums = centers.map(() => new Array(points[0].length).fill(0));
-    const counts = centers.map(() => 0);
-    for (let i = 0; i < points.length; i++) {
-      const c = assign[i];
-      counts[c]++;
-      for (let j = 0; j < points[i].length; j++) sums[c][j] += points[i][j];
-    }
-    for (let c = 0; c < centers.length; c++) {
-      if (counts[c]) { ncent[c] = sums[c].map((v) => v / counts[c]); }
-      else ncent[c] = points[centers[c]].slice();
+      if (v) seeds.push(l2Normalize(v));
     }
   }
-  const clusters = [];
-  for (let c = 0; c < centers.length; c++) {
-    const members = [];
-    for (let i = 0; i < assign.length; i++) if (assign[i] === c) members.push(i);
-    const major = (docs[members[0]] || "taste");
-    clusters.push({
-      id: c,
-      centroid: ncent[c],
-      weight: members.length,
-      size: members.length,
-      label: major,
+  for (const v of lovedVecs) if (v) seeds.push(l2Normalize(v));
+  if (!seeds.length) { state.clusters = []; state.has_taste = false; return; }
+  const kFinal = Math.min(MAX_CLUSTERS, seeds.length);
+  const cents = kmeansHalfvec(seeds, kFinal);
+  state.clusters = [];
+  state.nextId = 1;
+  state.tick = 0;
+  for (const c of cents) {
+    state.clusters.push({
+      id: state.nextId++,
+      centroid: l2Normalize(c.slice()),
+      weight: 1,
+      size: Math.ceil(seeds.length / kFinal),
+      label: labelFor(c),
       genre_dist: 0,
+      updated_at: state.tick++,
     });
   }
-  clusters.sort((a, b) => Math.abs(b.weight) - Math.abs(a.weight));
-  return clusters;
+  state.clusters.sort((a, b) => b.weight - a.weight);
+  state.has_taste = state.clusters.length > 0;
+  state.coverage = state.has_taste ? 1 : 0;
+  state.disliked = null;
+  state.shownCounts = {};
+}
+
+// ------------------------------------------------------------------ scoring + MMR (prod _recommend_score / _mmr_rerank)
+function parseGenres(g) {
+  if (!g) return [];
+  if (Array.isArray(g)) return g;
+  if (typeof g === "string") {
+    const s = g.trim();
+    if (s.startsWith("[")) { try { const a = JSON.parse(s); return Array.isArray(a) ? a : []; } catch { /* fall through */ } }
+    // fallback comma split
+    return s.split(",").map((x) => x.trim()).filter(Boolean);
+  }
+  return [];
+}
+
+function qualityScore(avg_rating, ratings_count, is_nyt) {
+  let q = 0;
+  if (avg_rating != null) q += (avg_rating / 5) * 0.4;
+  else q += 0.15;
+  if (ratings_count != null) {
+    const lc = Math.log10(Math.max(ratings_count, 1));
+    q += Math.min(lc / 5, 1) * 0.4; // 1k->0.24, 10k->0.32, 100k->0.4
+  } else q += 0.1;
+  if (is_nyt) q += 0.2;
+  return Math.min(q, 1);
+}
+function freshnessScore(shownCount) {
+  return 1 / (1 + Math.log(1 + shownCount));
+}
+function tasteSimilarity(bookVec, clusters) {
+  if (!bookVec || !clusters.length) return 0;
+  let best = -1;
+  for (const c of clusters) {
+    if (c.weight <= 0) continue;
+    const s = cosineSim(bookVec, c.centroid);
+    if (s > best) best = s;
+  }
+  return best < 0 ? 0 : best; // 0..1 (normalized vecs => cosine in -1..1, clamp neg to 0)
+}
+function dislikedPenalty(bookVec, disliked) {
+  if (!bookVec || !disliked || !disliked.vec) return 0;
+  const s = cosineSim(bookVec, disliked.vec);
+  return Math.max(0, s) * DISLIKED_PENALTY_W; // 0..0.35
+}
+function genreMatchScore(bookGenresArr, pickedGenres) {
+  if (!bookGenresArr.length || !pickedGenres.length) return 0;
+  const pickedSet = new Set(pickedGenres.map((x) => x.toLowerCase()));
+  for (const g of bookGenresArr) if (pickedSet.has(String(g).toLowerCase())) return 1;
+  // also substring fallback: e.g. "Comics & Graphic Novels" vs "comic"
+  const joined = bookGenresArr.join(" ").toLowerCase();
+  for (const pg of pickedSet) if (joined.includes(pg)) return 1;
+  return 0;
+}
+function getSourceWeights(source) {
+  // mirror _recommend_score per-source weights
+  if (source === "taste") return { w_taste: 0.45, w_genre: 0.25, w_quality: 0.20, w_fresh: 0.10 };
+  if (source === "trending") return { w_taste: 0.25, w_genre: 0.15, w_quality: 0.45, w_fresh: 0.15 };
+  // exploration
+  return { w_taste: 0.20, w_genre: 0.10, w_quality: 0.15, w_fresh: 0.55 };
+}
+function recommendScore(book, bookVec, source) {
+  const { w_taste, w_genre, w_quality, w_fresh } = getSourceWeights(source);
+  const bookGenres = parseGenres(book.genres);
+  const picked = [...selectedGenres];
+  const shown = state.shownCounts[book.isbn13 || book.isbn] || 0;
+  const q = qualityScore(book.avg_rating, book.ratings_count, !!book.is_nyt_bestseller);
+  const f = freshnessScore(shown);
+  const tRaw = tasteSimilarity(bookVec, state.clusters);
+  const dPen = dislikedPenalty(bookVec, state.disliked);
+  const t = Math.max(-1, tRaw - dPen); // taste component after penalty
+  const gM = genreMatchScore(bookGenres, picked);
+  let score = w_taste * t + w_genre * gM + w_quality * q + w_fresh * f;
+  if (score < 0) score = 0;
+  return { score, comp: { tRaw, dPen, t, gM, q, f }, bookGenres };
+}
+function mmrRerank(cands, k, lambda) {
+  // cands: [{isbn, vec, score, source, row}]
+  if (!cands.length || k <= 0) return [];
+  // sort by score desc for deterministic tie-break
+  cands = cands.slice().sort((a, b) => b.score - a.score);
+  const picked = [];
+  const remaining = cands.slice();
+  while (picked.length < k && remaining.length) {
+    let bestIdx = 0, bestMmr = -Infinity;
+    for (let i = 0; i < remaining.length; i++) {
+      const cand = remaining[i];
+      let maxSim = 0;
+      if (picked.length && cand.vec) {
+        for (const p of picked) {
+          if (!p.vec || !cand.vec) continue;
+          const s = cosineSim(cand.vec, p.vec);
+          if (s > maxSim) maxSim = s;
+        }
+      }
+      const mmr = lambda * cand.score - (1 - lambda) * maxSim;
+      if (mmr > bestMmr) { bestMmr = mmr; bestIdx = i; }
+    }
+    picked.push(remaining[bestIdx]);
+    remaining.splice(bestIdx, 1);
+  }
+  return picked;
 }
 
 // ------------------------------------------------------------------ Supabase RPC
@@ -204,37 +361,30 @@ function rpc(fn, args) {
   });
 }
 
-// ------------------------------------------------------------------ feed building
+// ------------------------------------------------------------------ feed building (UNIFIED)
 function coverUrl(f) {
   return f.cover_url || (f.cover_file ? COVER_BASE + "/" + f.cover_file : "");
 }
 
-// strict quality gate (mirrors the live app)
-function qualityPass(r) {
-  if ((r.ratings_count || 0) >= 5000) return true;
-  if (r.is_nyt_bestseller) return true;
-  if (r.src === "manga" && (r.avg_rating || 0) >= 4.0) return true;
-  if (r.src === "scraped") return true;
-  return false;
-}
-
 function decodeRows(rows, slice) {
   return (rows || []).map((r) => ({
-    isbn: r.isbn13,
+    isbn: r.isbn13 || r.isbn,
     title: r.title,
     author: r.author,
     genres: r.genres || "",
     description: r.description || "",
     pub_year: r.pub_year,
-    avg_rating: r.avg_rating != null ? +r.avg_rating.toFixed(2) : null,
+    avg_rating: r.avg_rating != null ? +(+r.avg_rating).toFixed(2) : null,
     ratings_count: r.ratings_count != null ? +r.ratings_count : null,
     src: r.src,
     is_nyt_bestseller: !!r.is_nyt_bestseller,
-    slice: slice,
+    slice: slice || r.__source || "",
+    source: r.__source || slice || "",
     dist: r.distance != null ? +(+r.distance).toFixed(3) : null,
     cluster_label: r.cluster_label || null,
     cover_url: coverUrl(r),
     vec: toVec(r.combined_vec),
+    _raw: r,
   }));
 }
 
@@ -245,52 +395,6 @@ async function fetchNearest(queryVec, k, seenIsbns) {
     k: k,
     p_ef_search: 100,
   });
-}
-
-function topClusters(n) {
-  return state.clusters.slice(0, n);
-}
-
-async function buildFeedInner(target, seenArr) {
-  const sel = [];
-  // top-2 by weight + 1 random from the rest
-  const top = topClusters(2);
-  sel.push(...top);
-  const rest = state.clusters.slice(2);
-  if (rest.length) { const r = rest[Math.floor(Math.random() * rest.length)]; sel.push(r); }
-  if (sel.length === 0) return { rows: [], picked: 0, ann_returned: 0, clusters_used: 0 };
-
-  const per = Math.max(8, Math.ceil((target * 3) / sel.length));
-  const results = [];
-  let ann = 0;
-  for (const c of sel) {
-    const rows = await fetchNearest(c.centroid, per, seenArr);
-    ann += rows.length;
-    rows.forEach((r) => { r.cluster_label = c.label; r.__club = c; });
-    results.push(...rows);
-  }
-  const gated = results.filter((r) => qualityPass(r));
-  const uniq = dedupe(gated);
-  return { rows: uniq, picked: uniq.length, ann_returned: ann, clusters_used: sel.length };
-}
-
-async function buildFeedMiddle(target, seenArr) {
-  if (!state.clusters.length) return { rows: [], picked: 0, sampled: 0, in_band: 0 };
-  const top = state.clusters[0];
-  const pool0 = await fetchNearest(top.centroid, 200, seenArr);
-  const bandMin = 0.30, bandMax = 0.55;
-  const inBand = pool0.filter((r) => {
-    const d = r.distance != null ? +r.distance : cosineDist(r.combined_vec ? toVec(r.combined_vec) : top.centroid, top.centroid);
-    return d >= bandMin && d <= bandMax;
-  });
-  const uniq = dedupe(inBand.filter((r) => qualityPass(r)));
-  return { rows: uniq, picked: uniq.length, sampled: pool0.length, in_band: inBand.length };
-}
-
-async function buildFeedOuter(target, seenArr) {
-  const rows = await rpc("random_popular_seed", { k: Math.max(target * 3, 20), seen_isbns: seenArr });
-  const uniq = dedupe(rows.filter((r) => qualityPass(r)));
-  return { rows: uniq, picked: uniq.length, sampled: rows.length };
 }
 
 function dedupe(rows) {
@@ -311,71 +415,115 @@ async function buildFeed() {
   feed.forEach((f) => seenSet.add(f.isbn));
   const seenArr = [...seenSet];
 
-  let innerTarget = 0, middleTarget = 0, outerTarget = total;
-  if (state.has_taste && state.clusters.length) {
-    innerTarget = Math.round(total * 0.5);
-    middleTarget = Math.round(total * 0.3);
-    outerTarget = total - innerTarget - middleTarget;
-  } else {
-    middleTarget = Math.round(total * 0.5);
-    outerTarget = total - middleTarget;
-  }
+  const hasTaste = state.has_taste && state.clusters.some((c) => c.weight > 0);
+  const cov = state.seen.size / TOTAL_CATALOG;
+  const EXPLORE_FLOOR = 0.25, EXPLORE_CEIL = 0.90, TARGET_COV = 0.01;
+  let lambda = EXPLORE_FLOOR + (EXPLORE_CEIL - EXPLORE_FLOOR) * Math.max(0, 1 - cov / TARGET_COV);
+  lambda = Math.max(0.35, Math.min(0.85, lambda));
+  // warm users converge toward relevance; cold users keep diversity high
+  if (!hasTaste) lambda = Math.max(lambda, 0.55);
 
-  let inner = { rows: [], picked: 0, ann_returned: 0, clusters_used: 0 };
-  let middle = { rows: [], picked: 0, sampled: 0, in_band: 0 };
-  let outer = { rows: [], picked: 0, sampled: 0 };
+  const sources = hasTaste ? ["taste", "exploration"] : ["trending", "exploration"];
+  const poolCap = Math.max(total * 4, 60);
 
-  if (state.has_taste && innerTarget > 0) {
-    inner = await buildFeedInner(innerTarget, seenArr);
-  }
-  if (middleTarget > 0) {
-    middle = await buildFeedMiddle(middleTarget, seenArr);
-  }
-  if (outerTarget > 0) {
-    outer = await buildFeedOuter(outerTarget, seenArr);
-  }
+  let annReturned = 0, trendingReturned = 0, explorationReturned = 0;
+  let candidatesRaw = [];
 
-  const chosen = [];
-  const pick = (pool, n, slice) => {
-    let i = 0;
-    while (chosen.length < total && i < pool.length && chosen.filter((c) => c.slice === slice).length < n) {
-      const r = pool[i];
-      if (!state.seen.has(r.isbn13 || r.isbn) && !chosen.some((c) => (c.isbn13 || c.isbn) === (r.isbn13 || r.isbn))) {
-        chosen.push(r);
-      }
-      i++;
+  if (sources.includes("taste")) {
+    const top = state.clusters.filter((c) => c.weight > 0).sort((a, b) => b.weight - a.weight).slice(0, 3);
+    for (const c of top) {
+      const rows = await fetchNearest(c.centroid, poolCap, seenArr);
+      annReturned += rows.length;
+      rows.forEach((r) => { r.__source = "taste"; r.__cluster = c; });
+      candidatesRaw.push(...rows);
     }
-  };
-  pick(inner.rows, innerTarget, "inner");
-  pick(middle.rows, middleTarget, "middle");
-  pick(outer.rows, outerTarget, "outer");
-  // top up any shortfall from outer pool
-  if (chosen.length < total) {
-    const missing = total - chosen.length;
-    pick(outer.rows, missing + outerTarget, "outer");
   }
+  if (sources.includes("trending")) {
+    const rows = await rpc("random_popular_seed", { k: poolCap, seen_isbns: seenArr });
+    trendingReturned = rows.length;
+    rows.forEach((r) => { r.__source = "trending"; });
+    candidatesRaw.push(...rows);
+  }
+  if (sources.includes("exploration")) {
+    const rows = await rpc("random_popular_seed", { k: poolCap, seen_isbns: seenArr });
+    explorationReturned = rows.length;
+    rows.forEach((r) => { r.__source = "exploration"; });
+    candidatesRaw.push(...rows);
+  }
+
+  // dedupe before scoring (series dedup not needed client-side)
+  const uniqMap = new Map();
+  for (const r of candidatesRaw) {
+    const key = r.isbn13 || r.isbn;
+    if (!uniqMap.has(key)) uniqMap.set(key, r);
+  }
+  let uniq = [...uniqMap.values()];
+
+  // blacklist filter + seen filter (server already filtered by seen, but double-check)
+  uniq = uniq.filter((r) => {
+    const k2 = r.isbn13 || r.isbn;
+    return !state.blacklist.has(k2) && !state.seen.has(k2);
+  });
+
+  // score each candidate per its source weights
+  const scored = [];
+  for (const r of uniq) {
+    const vec = toVec(r.combined_vec);
+    const src = r.__source || (hasTaste ? "taste" : "trending");
+    const { score, comp } = recommendScore(r, vec, src);
+    scored.push({ isbn: r.isbn13 || r.isbn, vec, score, source: src, row: r, comp });
+  }
+  scored.sort((a, b) => b.score - a.score);
+
+  // take top pool before MMR (keep more than total for diversity)
+  const preMmr = scored.slice(0, Math.min(scored.length, total * 4));
+
+  // MMR rerank to final total
+  const picked = mmrRerank(preMmr, total, lambda);
+
+  // update shown counts for freshness
+  for (const p of picked) {
+    state.shownCounts[p.isbn] = (state.shownCounts[p.isbn] || 0) + 1;
+  }
+
+  const decoded = picked.map((p) => {
+    const r = p.row;
+    const d = decodeRows([r], p.source)[0];
+    d.score = +p.score.toFixed(3);
+    d.mmrSource = p.source;
+    // keep vec for potential future scoring
+    d.vec = p.vec;
+    // annotate comps for debug
+    d._comp = p.comp;
+    return d;
+  });
 
   const stats = {
     allocation: {
-      inner_n: chosen.filter((c) => c.slice === "inner").length,
-      middle_n: chosen.filter((c) => c.slice === "middle").length,
-      outer_n: chosen.filter((c) => c.slice === "outer").length,
-      mode: state.has_taste ? "distance-ring" : "no-taste",
-      clusters_selected: state.clusters.length,
+      mode: hasTaste ? "unified-taste+explore" : "unified-trending+explore",
+      sources,
+      lambda: +lambda.toFixed(2),
+      coverage: +cov.toFixed(4),
+      clusters_selected: hasTaste ? Math.min(3, state.clusters.filter((c) => c.weight > 0).length) : 0,
+      clusters_total: state.clusters.length,
     },
     slices: {
-      inner: { ann_returned: inner.ann_returned, clusters_used: inner.clusters_used, gate_pass: inner.rows.length, picked: chosen.filter((c) => c.slice === "inner").length },
-      middle: { sampled: middle.sampled, in_band: middle.in_band, gate_pass: middle.rows.length, picked: chosen.filter((c) => c.slice === "middle").length },
-      outer: { sampled: outer.sampled, gate_pass: outer.rows.length, picked: chosen.filter((c) => c.slice === "outer").length },
+      taste: { ann_returned: annReturned, pool: scored.filter((s) => s.source === "taste").length, picked: picked.filter((p) => p.source === "taste").length },
+      trending: { sampled: trendingReturned, pool: scored.filter((s) => s.source === "trending").length, picked: picked.filter((p) => p.source === "trending").length },
+      exploration: { sampled: explorationReturned, pool: scored.filter((s) => s.source === "exploration").length, picked: picked.filter((p) => p.source === "exploration").length },
     },
-    returned: chosen.length,
+    scoring: {
+      scored_total: scored.length,
+      pre_mmr: preMmr.length,
+    },
+    returned: decoded.length,
   };
   state.allocation = stats.allocation;
   state.slices = stats.slices;
-  return { feed: decodeRows(chosen, ""), stats };
+  return { feed: decoded, stats };
 }
 
-// ------------------------------------------------------------------ UI wiring (mostly identical to the offline demo)
+// ------------------------------------------------------------------ UI wiring
 async function init() {
   sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
   state = freshState();
@@ -435,48 +583,50 @@ async function fetchFeed(seed = lastSeed) {
   fetching = true;
   try {
     const data = await buildFeed();
-    // merge slice info from buildFeed's decoded rows
     feed = data.feed.map((f) => ({ ...f }));
+    feedIndex = 0;
     renderFeed();
     renderPipeline(data.stats, mode);
     renderSignals();
-    // top up to target like the offline sim's loop
-    let tries = 0;
-    const target = mode === "fyp" ? 18 : 12;
-    while (tries < 2 && data.feed.length < target && mode !== "picked") {
-      lastSeed += 1;
-      const more = await buildFeed();
-      const have = new Set(feed.map((f) => f.isbn));
-      const fresh = more.feed.filter((f) => !have.has(f.isbn));
-      if (!fresh.length) break;
-      feed = feed.concat(fresh);
-      renderFeed();
-      renderPipeline(more.stats, mode);
-      tries += 1;
-    }
   } finally {
     fetching = false;
   }
 }
 
 async function fetchPicked() {
+  // Picked tab: top ANN from taste clusters, scored + MMR (no exploration)
   if (!state.has_taste || !state.clusters.length) {
     feed = [];
     renderFeed();
     renderPipeline({ note: "no-taste", allocation: {}, slices: {}, returned: 0 }, "picked");
     return;
   }
-  const top = topClusters(3);
-  const seen = [...state.seen];
+  const seen = [...state.seen, ...feed.map((f) => f.isbn)];
   let rows = [];
+  const top = state.clusters.filter((c) => c.weight > 0).sort((a, b) => b.weight - a.weight).slice(0, 3);
   for (const c of top) {
-    const r = await fetchNearest(c.centroid, 20, seen);
+    const r = await fetchNearest(c.centroid, 24, seen);
+    r.forEach((x) => { x.__source = "taste"; });
     rows.push(...r);
   }
-  const uniq = dedupe(rows.filter((r) => qualityPass(r)));
-  feed = decodeRows(uniq.slice(0, 12), "picked");
+  const uniq = dedupe(rows);
+  // score + MMR
+  const scored = uniq.map((r) => {
+    const vec = toVec(r.combined_vec);
+    const { score } = recommendScore(r, vec, "taste");
+    return { isbn: r.isbn13 || r.isbn, vec, score, source: "taste", row: r };
+  }).sort((a, b) => b.score - a.score);
+  const picked = mmrRerank(scored, 12, 0.55);
+  feed = picked.map((p) => {
+    const d = decodeRows([p.row], "picked")[0];
+    d.score = +p.score.toFixed(3);
+    d.source = p.source;
+    d.vec = p.vec;
+    return d;
+  });
+  feedIndex = 0;
   renderFeed();
-  renderPipeline({ allocation: {}, slices: {}, returned: feed.length }, "picked");
+  renderPipeline({ allocation: { mode: "picked-taste", lambda: 0.55, sources: ["taste"] }, slices: {}, returned: feed.length }, "picked");
 }
 
 async function loadMore() {
@@ -508,7 +658,6 @@ async function applyOnboarding() {
   const genresArr = [...selectedGenres];
   let lovedVecs = [];
   if (lovedBooks.size) {
-    // fetch vectors for the loved books via get_books_by_isbns
     try {
       const isbns = [...lovedBooks.keys()];
       const rows = await rpc("get_books_by_isbns", { isbns });
@@ -518,6 +667,7 @@ async function applyOnboarding() {
   buildTasteFromOnboarding(genresArr, lovedVecs);
   state.total_swipes += lovedBooks.size;
   state.positive_signals += lovedBooks.size;
+  // count onboarding books as seen-ish for coverage but not blacklisted
   lovedBooks.clear();
   $("apply-onboarding").disabled = true;
   updateGenreChips();
@@ -528,23 +678,42 @@ async function applyOnboarding() {
 
 async function sendSignal(isbn, signal, btn) {
   const book = feed.find((f) => f.isbn === isbn);
-  // snapshot for undo
+  const vec = book && book.vec ? book.vec : null;
+  // snapshot for undo (deep copy clusters + disliked + shownCounts)
   histStack.push({
-    snapshot: JSON.parse(JSON.stringify({
+    snapshot: {
       has_taste: state.has_taste, total_swipes: state.total_swipes,
-      positive_signals: state.positive_signals, tick: state.tick, signals: state.signals,
+      positive_signals: state.positive_signals, tick: state.tick, signals: [...state.signals],
       clusters: state.clusters.map((c) => ({ ...c, centroid: c.centroid.slice() })),
-    })),
+      disliked: state.disliked ? { vec: state.disliked.vec.slice(), weight: state.disliked.weight } : null,
+      nextId: state.nextId,
+      shownCounts: { ...state.shownCounts },
+      seen: new Set(state.seen),
+      blacklist: new Set(state.blacklist),
+    },
     isbn, signal,
   });
   state.total_swipes += 1;
-  state.tick += 1;
-  const w = WEIGHTS[signal] || 0;
-  if (w > 0) state.positive_signals += 1;
+  // tick managed inside apply* for taste/disliked; also bump for signal log
+  const isPositive = signal === "like" || signal === "save" || signal === "tap";
+  if (isPositive) state.positive_signals += 1;
+  if (vec) {
+    if (signal === "not_for_me") {
+      applyDislikedSignal(vec);
+    } else if (isPositive) {
+      // like/save/tap all map to weight 1 (tap 0.5 in prod but browser treats as positive)
+      applyTasteSignal(l2Normalize(vec.slice()));
+    }
+  } else {
+    state.tick += 1;
+  }
   state.seen.add(isbn);
   state.signals.push({ tick: state.tick, signal, isbn });
   if (signal === "not_for_me") state.blacklist.add(isbn);
-  if (book && book.vec) addSignal(book.vec, w >= 0 ? 1 : -1);
+  // update coverage
+  state.coverage = Math.min(1, state.seen.size / TOTAL_CATALOG);
+  // freshness shown count already updated on fetch; also bump on explicit signal
+  state.shownCounts[isbn] = (state.shownCounts[isbn] || 0) + 1;
   if (btn) {
     btn.classList.add("done");
     btn.title = "Click to undo";
@@ -563,6 +732,12 @@ async function undoSignal(isbn, btn) {
     state.tick = s.tick;
     state.signals = s.signals;
     state.clusters = s.clusters;
+    state.disliked = s.disliked;
+    state.nextId = s.nextId;
+    state.shownCounts = s.shownCounts;
+    state.seen = s.seen;
+    state.blacklist = s.blacklist;
+    state.coverage = Math.min(1, state.seen.size / TOTAL_CATALOG);
   }
   if (btn) {
     btn.classList.remove("done");
@@ -578,7 +753,7 @@ async function reset() {
   state = freshState();
   state.seen = new Set();
   state.blacklist = new Set();
-  feed = []; selectedGenres.clear(); lovedBooks.clear(); histStack = []; lastSeed = 0;
+  feed = []; selectedGenres.clear(); lovedBooks.clear(); histStack = []; lastSeed = 0; feedIndex = 0;
   $("onboarding-note").textContent = "";
   $("genre-grid").querySelectorAll(".genre-chip").forEach((el) => el.classList.remove("sel"));
   updateGenreChips();
@@ -641,81 +816,98 @@ function renderState() {
   if (!state) return;
   const b = [];
   b.push(`<span class="badge ${state.has_taste ? "warm" : ""}">taste: ${state.has_taste ? "built" : "empty"}</span>`);
-  b.push(`<span class="badge warm">quality filter: ${QUALITY_TAG_STRICT}</span>`);
+  b.push(`<span class="badge warm">unified scoring + MMR</span>`);
+  b.push(`<span class="badge warm">quality: ${QUALITY_TAG_STRICT}</span>`);
   $("state-badges").innerHTML = b.join("");
   renderSession();
 }
 
 function renderSession() {
   if (!state) return;
+  const covPct = (state.coverage * 100).toFixed(2);
+  const dislikedW = state.disliked ? state.disliked.weight.toFixed(2) : "—";
   const rows = [
-    ["Coverage", `${(state.coverage * 100).toFixed(1)}%`],
+    ["Coverage", `${covPct}%`],
     ["Signals", `${state.total_swipes}`],
     ["Positive", `${state.positive_signals}`],
     ["Clusters", `${state.clusters.length} / 5`],
+    ["Disliked w", `${dislikedW}`],
+    ["Lambda", `${(state.allocation && state.allocation.lambda != null) ? state.allocation.lambda : "—"}`],
   ];
   $("session-list").innerHTML = rows.map(([k, v]) =>
     `<div class="session-row"><span class="k">${k}</span><span class="v">${v}</span></div>`
   ).join("") +
-  `<div class="session-tip">Coverage — how broad your taste is. Signals — books you acted on. Positive — likes, saves &amp; interested. Clusters — active taste clusters (max 5). Your taste is stored only in this browser tab for this session.</div>`;
+  `<div class="session-tip">Coverage — seen / catalog. Lambda — MMR diversity (0.35 relevance → 0.85 explore). Disliked w — accumulated negative centroid weight (decay 0.90).</div>`;
 }
 
 function renderClusters() {
   const el = $("cluster-list");
-  $("cluster-empty").style.display = state.clusters.length ? "none" : "";
-  el.innerHTML = state.clusters.map((c) => {
+  $("cluster-empty").style.display = state.clusters.length || state.disliked ? "none" : "";
+  let html = state.clusters.map((c) => {
     const neg = c.weight < 0;
     const w = Math.min(Math.abs(c.weight) * 50, 100);
     return `<div class="cluster">
       <div class="row"><span><b class="${neg ? "neg" : ""}">${escapeHtml((c.label || "?").replace(/[\s/|+-]+$/, ""))}</b> · ${c.size} sig</span>
-        <span>w=${c.weight.toFixed(2)} · gd=${(c.genre_dist || 0).toFixed(2)}</span></div>
+        <span>w=${c.weight.toFixed(2)} · #${c.id}</span></div>
       <div class="bar"><div class="${neg ? "neg" : ""}" style="width:${w}%"></div></div>
     </div>`;
   }).join("");
+  if (state.disliked) {
+    const dw = Math.min(state.disliked.weight * 20, 100);
+    html += `<div class="cluster" style="opacity:0.85"><div class="row"><span><b class="neg">disliked</b> · not-for-me centroid</span><span>w=${state.disliked.weight.toFixed(2)}</span></div><div class="bar"><div class="neg" style="width:${dw}%"></div></div></div>`;
+  }
+  el.innerHTML = html;
 }
 
 function renderPipeline(stats, m) {
   const el = $("pipeline");
   if (!state) { el.innerHTML = ""; $("pipeline-empty").style.display = ""; return; }
-  if (!stats || (stats.note === "no-taste" && m === "picked") || !state.clusters.length) {
-    el.innerHTML = `<div class="hint">No taste profile yet. Pick genres in Onboarding to get started.</div>`;
-    $("pipeline-empty").style.display = "none";
-    return;
+  if (!stats || (stats.note === "no-taste" && m === "picked") || (!state.has_taste && m !== "search" && !stats.allocation)) {
+    // keep helpful hint before first fetch
+    if (!state.has_taste && !stats) {
+      el.innerHTML = `<div class="hint">No taste profile yet. Pick genres and apply to build your taste.</div>`;
+      $("pipeline-empty").style.display = "none";
+      return;
+    }
   }
   if (!stats) { el.innerHTML = ""; $("pipeline-empty").style.display = ""; return; }
   $("pipeline-empty").style.display = "none";
   const a = stats.allocation || {};
-  let allocBar = "";
-  if (m === "fyp") {
-    const total = (a.inner_n || 0) + (a.middle_n || 0) + (a.outer_n || 0);
-    allocBar = `<div class="pipe-alloc">
-      <div class="inner" style="width:${(a.inner_n || 0) / total * 100 || 0}%"></div>
-      <div class="middle" style="width:${(a.middle_n || 0) / total * 100 || 0}%"></div>
-      <div class="outer" style="width:${(a.outer_n || 0) / total * 100 || 0}%"></div>
-    </div>
-    <div class="hint" style="margin-top:0">${a.mode || "?"} · cluster-count: ${a.clusters_selected ?? "?"}</div>`;
+  let head = "";
+  if (m === "fyp" || m === "disc") {
+    const srcs = (a.sources || []).join(" + ") || (a.mode || "?");
+    head = `<div class="slice"><h3>${escapeHtml(a.mode || "unified")}</h3><div class="kv"><span>sources: <b>${escapeHtml(srcs)}</b> · λ=${a.lambda ?? "?"} · cov=${a.coverage ?? "?"}</span><span>clusters: <b>${a.clusters_selected ?? "?"} / ${a.clusters_total ?? state.clusters.length}</b></span></div></div>`;
+  } else if (m === "picked") {
+    head = `<div class="slice"><h3>Picked for you</h3><div class="kv"><span>taste ANN → score → MMR</span><span>λ=0.55</span></div></div>`;
   }
-  const slices = renderSliceStats(stats.slices, m);
-  const note = m === "picked" ? `Picked: ANN against your taste centroids.`
-                              : m === "disc" ? `Discovery: taste-close + far + curated random.`
-                              : "";
-  el.innerHTML = `${allocBar}${slices}
-    <div class="hint">${note} returned: <b>${stats.returned ?? "?"}</b> books.</div>`;
+  const slices = renderSliceStats(stats.slices, m, stats);
+  const note = m === "picked" ? `Picked: ANN against your taste centroids, scored (w_taste 0.45) then MMR.`
+                              : `Unified: each candidate scored (w_taste/w_genre/w_quality/w_fresh per source), then <b>MMR</b> reranked for diversity. Returned: <b>${stats.returned ?? "?"}</b> books.`;
+  el.innerHTML = `${head}${slices}
+    <div class="hint">${note}</div>`;
 }
 
-function renderSliceStats(slices, m) {
+function renderSliceStats(slices, m, stats) {
   let out = "";
-  const spec = m === "fyp"
-    ? [["inner", "Inner · closest ANN (50%)"], ["middle", "Middle · 0.30-0.55 band (30%)"], ["outer", "Outer · random quality (20%)"]]
-    : [["inner", "Taste close"], ["middle", "Explore band"], ["outer", "Random quality"]];
-  for (const [key, label] of spec) {
-    const s = (slices || {})[key] || {};
-    if (key === "inner")
-      out += sliceHtml(label, `clusters: <b>${s.clusters_used ?? 0}</b> · ann: <b>${s.ann_returned ?? 0}</b>`, `gate pass: <b>${s.gate_pass ?? 0}</b> · picked: <b class="hot">${s.picked ?? 0}</b>`);
-    else if (key === "middle")
-      out += sliceHtml(label, `sampled: <b>${s.sampled ?? 0}</b> · in band: <b>${s.in_band ?? 0}</b>`, `gate pass: <b>${s.gate_pass ?? 0}</b> · picked: <b class="hot">${s.picked ?? 0}</b>`);
-    else
-      out += sliceHtml(label, `sampled: <b>${s.sampled ?? 0}</b>`, `gate pass: <b>${s.gate_pass ?? 0}</b> · picked: <b class="hot">${s.picked ?? 0}</b>`);
+  const scoring = stats && stats.scoring ? `scored: <b>${stats.scoring.scored_total ?? "?"}</b> · pre-MMR: <b>${stats.scoring.pre_mmr ?? "?"}</b>` : "";
+  if (m === "fyp" || m === "disc") {
+    const t = (slices || {}).taste || {};
+    const tr = (slices || {}).trending || {};
+    const ex = (slices || {}).exploration || {};
+    if (t.pool != null || t.ann_returned != null)
+      out += sliceHtml("Taste pool · ANN nearest (scored w_taste 0.45)", `ann: <b>${t.ann_returned ?? 0}</b> · pool: <b>${t.pool ?? 0}</b>`, `picked: <b class="hot">${t.picked ?? 0}</b>`);
+    if (tr.sampled != null || tr.pool != null)
+      out += sliceHtml("Trending pool · popular random (scored w_quality 0.45)", `sampled: <b>${tr.sampled ?? 0}</b> · pool: <b>${tr.pool ?? 0}</b>`, `picked: <b class="hot">${tr.picked ?? 0}</b>`);
+    if (ex.sampled != null)
+      out += sliceHtml("Exploration pool · diverse random (scored w_fresh 0.55)", `sampled: <b>${ex.sampled ?? 0}</b> · pool: <b>${ex.pool ?? 0}</b>`, `picked: <b class="hot">${ex.picked ?? 0}</b>`);
+    if (scoring) out += `<div class="slice"><h3>Scoring → MMR</h3><div class="kv"><span>${scoring}</span><span>λ=${(stats.allocation && stats.allocation.lambda) ?? "?"}</span></div></div>`;
+  } else {
+    for (const [key, label] of [["taste", "Taste"], ["trending", "Trending"], ["exploration", "Exploration"]]) {
+      const s = (slices || {})[key];
+      if (!s) continue;
+      out += sliceHtml(label, `pool: <b>${s.pool ?? s.sampled ?? 0}</b>`, `picked: <b class="hot">${s.picked ?? 0}</b>`);
+    }
+    if (scoring) out += `<div class="slice"><h3>Scoring → MMR</h3><div class="kv"><span>${scoring}</span><span></span></div></div>`;
   }
   return out;
 }
@@ -800,7 +992,7 @@ function cardHtml(f, fyp) {
   return `<div class="fbook" data-isbn="${escapeHtml(f.isbn)}">
     <div class="cov">
       ${coverHtml}
-      ${f.slice ? `<span class="slot-tag ${f.slice}">${escapeHtml(f.slice)}</span>` : ""}
+      ${f.source ? `<span class="slot-tag ${f.source}">${escapeHtml(f.source)}</span>` : (f.slice ? `<span class="slot-tag ${f.slice}">${escapeHtml(f.slice)}</span>` : "")}
     </div>
     <div class="body">
       <div class="title" title="${escapeHtml(f.title || "")}">${escapeHtml(title)}</div>
@@ -834,15 +1026,20 @@ function attachActions(root) {
 }
 
 function buildReason(f) {
-  if (f.slice === "search") {
+  if (f.slice === "search" || f.source === "search") {
     const parts = ["<b>search</b>"];
     if (f.src) parts.push(`src: ${escapeHtml(f.src)}`);
     return parts.join(" · ");
   }
   const parts = [];
-  parts.push(`<b>${escapeHtml(f.slice || "")}</b>`);
-  if (f.cluster_label) parts.push(`cluster: ${escapeHtml(f.cluster_label)}`);
-  if (f.dist != null) parts.push(`dist=${f.dist.toFixed(2)}`);
+  const srcLabel = f.source || f.mmrSource || f.slice || "";
+  if (srcLabel) parts.push(`<b>${escapeHtml(srcLabel)}</b>`);
+  if (f.score != null) parts.push(`score=${f.score.toFixed(2)}`);
+  if (f._comp) {
+    // compact comp: t/q/f
+    const c = f._comp;
+    parts.push(`t=${c.t.toFixed(2)} q=${c.q.toFixed(2)} f=${c.f.toFixed(2)}`);
+  } else if (f.dist != null) parts.push(`dist=${f.dist.toFixed(2)}`);
   return parts.join(" · ");
 }
 
@@ -860,7 +1057,7 @@ function openDiscover(isbn) {
   const coverHtml = book.cover_url
     ? `<img src="${book.cover_url}" alt="${escapeHtml(book.title || "")}">`
     : `<div class="no-cover">${escapeHtml(book.title || "No Cover")}</div>`;
-  const genresArr = book.genres ? (typeof book.genres === "string" ? (() => { try { return JSON.parse(book.genres); } catch { return []; } })() : book.genres) : [];
+  const genresArr = parseGenres(book.genres);
   const tags = genresArr.map((g) => `<span class="tag">${escapeHtml(g)}</span>`).join("");
   inner.innerHTML = `
     <div class="cover">${coverHtml}</div>

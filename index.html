@@ -177,36 +177,51 @@
 
     <h3>Dynamic Taste Clustering</h3>
     <p>
-      When you interact with a book (like, save, skip), its vector is compared against
-      your existing taste clusters. If it's close enough (cosine distance &le; 0.45),
-      it merges into the nearest cluster, pulling the centroid toward it. If it's too
-      far, a new cluster is created. Up to <b>5 clusters</b> coexist — so enjoying
+      When you like or save a book, its vector is compared against your existing taste
+      clusters. If it's close enough (cosine distance &le; 0.45), it merges into the
+      nearest cluster with a <b>weight-scaled L2-normalized</b> update
+      (<code>centroid = normalize(centroid·w<sub>old</sub> + vec·1)</code>); if it's
+      too far, a new cluster is created. Up to <b>5 clusters</b> coexist — so enjoying
       both science fiction and romance doesn't collapse into a single average. Each
-      cluster has a weight that decays over time (0.95 per interaction), so old
-      preferences naturally fade unless reinforced. The indigo blobs on the map show
-      where these clusters sit in vector space, and the drift trails show how they
-      move as your taste evolves.
+      cluster's weight decays by <b>0.95</b> per taste signal so old preferences fade
+      unless reinforced; the least-recently-used cluster is evicted at capacity. A
+      separate <b>disliked centroid</b> (decay <b>0.90</b>, penalty <b>0.35</b>) tracks
+      your "Not for me" signals so the scorer can push similar books down without
+      polluting taste. Onboarding unions the <b>sub1..5</b> sub-centroids for each
+      chosen genre and k-means them to ≤5 with the same <code>_kmeans_halfvec</code>
+      spread init — the same code the live Android app uses.
     </p>
 
-    <h3>Distance-Ring Serving</h3>
+    <h3>Unified Scoring + MMR</h3>
     <p>
-      Every book in your feed is placed into one of three distance rings, each
-      with a different purpose:
+      The retired distance-ring model is gone. Every candidate is now scored with a
+      single <code>_recommend_score</code> and then diversity-reranked with
+      <code>_mmr_rerank</code> — identical to production
+      (<code>20260902000000_unified_mmr_recommendations.sql</code>):
     </p>
     <ul>
-      <li><b>Inner (50%)</b> — exact nearest-neighbor search against your top-2
-        taste cluster centroids plus one random cluster. These are the books
-        closest to what you've already enjoyed.</li>
-      <li><b>Middle (30%)</b> — books at a deliberate mid-distance (0.30–0.55
-        cosine) from your taste centroid. This is how the engine introduces you
-        to new genres and authors without going completely random.</li>
-      <li><b>Outer (20%)</b> — highly-rated crowd favorites (avg rating &ge; 4.0)
-        picked from the random quality pool. These keep the feed grounded.</li>
+      <li><b>Taste</b> books come from ANN nearest against your top-3 clusters;
+        <b>trending</b> and <b>exploration</b> come from the quality random pool.
+        Warm users get <code>taste + exploration</code>, cold users get
+        <code>trending + exploration</code>.</li>
+      <li><b>Score</b> per source: taste 0.45/0.25/0.20/0.10
+        (taste/genre/quality/freshness), trending 0.25/0.15/0.45/0.15,
+        exploration 0.20/0.10/0.15/0.55. Taste similarity is max cosine to any
+        positive cluster minus <code>0.35·sim(disliked)</code>; genre match is 1 if
+        the book shares a picked genre; quality mixes normalized rating +
+        log<sub>10</sub>(ratings_count) + NYT boost; freshness is
+        <code>1/(1+ln(1+shown_count))</code> so seen books sink.</li>
+      <li><b>MMR</b> reranks the top-scored pool:
+        <code>mmr = λ·score − (1−λ)·maxSimToPicked</code>. λ is
+        coverage-driven — <code>0.25 + 0.65·max(0,1−cov/0.01)</code> clamped to
+        <b>0.35–0.85</b> (high diversity when you've seen little, more relevance
+        as coverage grows; cold users floor at 0.55). The pipeline card shows
+        the exact λ, sources, and picked counts for your feed.</li>
     </ul>
     <p>
-      Every book must pass the strict quality gate (ratings &ge; 5000, NYT
-      bestseller, manga &ge; 4.0, or scraped). The pipeline card above shows the
-      exact allocation for your current feed.
+      No hard ring percentages — the balance of relevance vs. discovery falls out
+      of the weights + MMR, with the strict quality gate still applied via the
+      quality component.
     </p>
 
     <h3>Quality Gates</h3>
@@ -238,11 +253,12 @@
       <b>Supabase RPCs</b> running against the real catalog stored in
       <b>pgvector</b> with a binary-quantized <b>HNSW</b> index (sub-millisecond
       ANN search). The book vectors are pre-computed with <b>SigLIP 2</b> +
-      <b>bge-base</b> (768-d). Your taste profile lives <b>only in your browser
-      memory</b> for this session — it is never stored or sent anywhere — and the
-      feed is assembled client-side from the same distance-ring logic the live app
-      uses. Refresh the page and the taste resets. Cover images come from
-      Cloudflare R2.
+      <b>bge-base</b> (768-d). Your taste profile (5 clusters + disliked centroid)
+      lives <b>only in your browser memory</b> for this session — it is never
+      stored or sent anywhere — and the feed is assembled client-side from the
+      same <b>unified scoring + MMR</b> logic the live Android app uses
+      (coverage-driven λ, per-source weights, scored pools → MMR rerank). Refresh
+      the page and the taste resets. Cover images come from Cloudflare R2.
     </p>
   </div>
 </section>

@@ -162,9 +162,9 @@ main.cols > *, .map-clusters-wrap > * { min-width: 0; }
   padding: 12px; line-height: 1.3;
 }
 .fbook .slot-tag { position: absolute; top: 8px; left: 8px; font-size: 11px; font-weight: 700; padding: 2px 8px; border-radius: 999px; background: rgba(26,31,43,.78); color: #fff; }
-.fbook .slot-tag.inner, .fbook .slot-tag.picked { background: rgba(124,58,237,.92); color: #fff; }
-.fbook .slot-tag.middle { background: rgba(37,99,235,.92); color: #fff; }
-.fbook .slot-tag.outer { background: rgba(13,148,136,.92); color: #fff; }
+.fbook .slot-tag.inner, .fbook .slot-tag.picked, .fbook .slot-tag.taste { background: rgba(124,58,237,.92); color: #fff; }
+.fbook .slot-tag.middle, .fbook .slot-tag.exploration { background: rgba(37,99,235,.92); color: #fff; }
+.fbook .slot-tag.outer, .fbook .slot-tag.trending { background: rgba(13,148,136,.92); color: #fff; }
 .fbook .slot-tag.search { background: rgba(37,99,235,.92); color: #fff; }
 .fbook .body { padding: 10px; display: flex; flex-direction: column; flex: 1; }
 .fbook .title {
